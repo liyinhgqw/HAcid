@@ -292,7 +292,7 @@ public class _04_TransactionRecoveryTest {
      *
      * @throws IOException
      */
-//    @Test
+    @Test
     public void testDontRecoverTxnWithoutEndTimestamp() throws IOException {
         HAcidTxn txnA = new HAcidTxn(testSample.client);
             HAcidPut pput1 = new HAcidPut(testSample.sampleUserTable, Bytes.toBytes("person17"));
@@ -307,20 +307,7 @@ public class _04_TransactionRecoveryTest {
         // In this get, while searching for the Snapshot Isolated Read Timestamp,
         // txnB should do nothing about txnA
 
-        assertNotSame("content in user table cannot be the active txn's put",
-            "monteiro",
-            Bytes.toString(resultGet.getColumnLatest(Bytes.toBytes("info"), Bytes.toBytes("name")).getValue())
-        );
-        assertNotSame("timestamp of committed-at cell is not the active txn's start-ts",
-            txnA.getStartTimestamp(),
-            (
-                resultGet.getColumnLatest(
-                    Schema.FAMILY_HACID,
-                    Schema.QUALIFIER_USERTABLE_COMMITTED_AT
-                )
-                .getTimestamp()
-            )
-        );
+        assertNull(resultGet.getColumnLatest(Bytes.toBytes("info"), Bytes.toBytes("name")));
 
         Result r2 = testSample.client.getTimestampData(txnA.getStartTimestamp());
         assertEquals("state of the transaction is \'active\'",
