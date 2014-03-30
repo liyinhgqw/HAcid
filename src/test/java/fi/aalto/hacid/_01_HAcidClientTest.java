@@ -17,11 +17,22 @@
  */
 package fi.aalto.hacid;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.*;
+import org.apache.hadoop.hbase.client.*;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.log4j.Logger;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
+
+import java.io.IOException;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.NavigableMap;
+
 import static org.junit.Assert.*;
 
 /**
@@ -31,6 +42,7 @@ import static org.junit.Assert.*;
  * @author Andre Medeiros <andre.medeiros@aalto.fi>
  */
 public class _01_HAcidClientTest {
+    static Logger LOG = Logger.getLogger(_01_HAcidClientTest.class.getName());
 
     private static HAcidTestSample1 testSample;
 
@@ -68,6 +80,56 @@ public class _01_HAcidClientTest {
     //@Test
     public void testClose() throws Exception {
         // T O D O
+    }
+
+    @Test
+    public void testPrepare() throws Exception {
+        Configuration conf = HBaseConfiguration.create();
+
+        HBaseAdmin admin = new HBaseAdmin(conf);
+
+        // Makes HAcid tables
+        HAcidClient client = new HAcidClient(conf);
+        assertTrue(admin.tableExists(Schema.TABLE_TIMESTAMP_LOG));
+
+        // Makes a sample user table
+        HTableDescriptor descSampleUserTable = new HTableDescriptor("prepare");
+        HColumnDescriptor infoFamily = new HColumnDescriptor("info");
+        infoFamily.setMaxVersions(100);
+        descSampleUserTable.addFamily(infoFamily);
+        admin.createTable(descSampleUserTable);
+
+        // Populate user table:
+        HTable userTable = new HTable(conf, "prepare");
+        Put put1 = new Put("test".getBytes());
+
+        put1.add(
+                Bytes.toBytes("info"),
+                Bytes.toBytes("name"),
+                Bytes.toBytes("test1")
+        );
+        userTable.put(put1);
+        put1.add(
+                Bytes.toBytes("info"),
+                Bytes.toBytes("name"),
+                Bytes.toBytes("test2")
+        );
+        userTable.put(put1);
+        put1.add(
+                Bytes.toBytes("info"),
+                Bytes.toBytes("name"),
+                Bytes.toBytes("test3")
+        );
+        userTable.put(put1);
+
+        testSample.client.prepareUserTable(userTable);
+        Get get = new Get("test".getBytes());
+        Result rst = userTable.get(get);
+        Bytes.equals(rst.getColumnLatest("info".getBytes(), "name".getBytes()).getValue(), "test3".getBytes());
+
+        admin.disableTable("prepare");
+        admin.deleteTable("prepare");
+
     }
 
     /**

@@ -283,6 +283,18 @@ public class HAcidTxn {
     boolean decideCommitOrAbort(int conflictCheckAttempts) throws IOException {
         byte[] state = null;
         try {
+            Result rst = _client.getTimestampData(start_ts);
+            byte[] type = rst.getColumnLatest(Schema.FAMILY_HACID, Schema.QUALIFIER_TS_TYPE).getValue();
+            if (Bytes.equals(type, Schema.STATE_COMMITTED)) {
+                rollforwardWrites();
+                writes.clear();
+                return true;
+            } else if (Bytes.equals(type, Schema.STATE_ABORTED)) {
+                rollbackWrites();
+                writes.clear();
+                return false;
+            }
+
             if(_client.canCommit(this, conflictCheckAttempts)) {
                 _client.setStateCommitted(this); // writes the state to HBase
                 state = Schema.STATE_COMMITTED; // local variable

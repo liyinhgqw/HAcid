@@ -18,9 +18,11 @@
 package fi.aalto.hacid;
 
 import java.io.IOException;
-import java.util.Collection;
-import java.util.LinkedList;
-import java.util.List;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
@@ -72,7 +74,12 @@ public class HAcidClient {
 
     private HTable timestamp_log_table;
     Configuration configuration_HBase;
+
     private static int SCAN_TIMESTAMP_MAX_CACHE = 1024; // max num. rows in scan
+
+    ExecutorService executorService = Executors.newFixedThreadPool(1);
+    PurgeRunnable purgeThread = new PurgeRunnable();
+
 
     public enum IsolationLevel {
         /**
@@ -171,6 +178,7 @@ public class HAcidClient {
             timestamp_log_table = null;
         }
         timestamp_log_table = new HTable(config, Schema.TABLE_TIMESTAMP_LOG);
+        executorService.execute(purgeThread);
     }
 
     /**
@@ -178,8 +186,12 @@ public class HAcidClient {
      *
      * @throws IOException
      */
-    public void close() throws IOException {
+    public void close() throws IOException, InterruptedException {
         LOG.debug("Closing HAcid client ...");
+
+        purgeThread.stop();
+        executorService.shutdown();
+        executorService.awaitTermination(1, TimeUnit.DAYS);
 
         timestamp_log_table.close();
     }
@@ -834,6 +846,7 @@ public class HAcidClient {
      * @return Whether or not HAcid is installed at the HBase site
      * @throws Exception
      */
+    @Deprecated
     public static boolean isInstalled(Configuration config) throws Exception {
         if(config == null) {
             LOG.error("No connection to HBase. Configuration is null");
@@ -975,22 +988,36 @@ public class HAcidClient {
             Result result;
             while((result = scanner.next()) != null) {
                 LinkedList<Put> reinsertSet = new LinkedList<Put>();
-                for(KeyValue kv : result.raw()) {
-                    if(kv.getTimestamp() != Schema.TIMESTAMP_INITIAL_LONG) {
-                        Put put = new Put(result.getRow(), Schema.TIMESTAMP_INITIAL_LONG);
-                        put.add(kv.getFamily(), kv.getQualifier(), kv.getValue());
-                        reinsertSet.add(put);
-                        Delete deleteThisVersion = new Delete(result.getRow());
-                        deleteThisVersion.deleteColumn(kv.getFamily(), kv.getQualifier(), kv.getTimestamp());
-                        usertable.delete(deleteThisVersion);
+                LinkedList<Delete> deleteSet = new LinkedList<Delete>();
+
+                NavigableMap<byte[], NavigableMap<byte[], NavigableMap<Long, byte[]>>> families
+                        = result.getMap();
+                for (Map.Entry<byte[], NavigableMap<byte[], NavigableMap<Long, byte[]>>> family: families.entrySet()) {
+                    byte[] fl = family.getKey();
+                    NavigableMap<byte[], NavigableMap<Long, byte[]>> qualifiers = family.getValue();
+                    for (Map.Entry<byte[], NavigableMap<Long, byte[]>> qualifier: qualifiers.entrySet()) {
+                        byte[] ql = qualifier.getKey();
+                        NavigableMap<Long, byte[]> vs = qualifier.getValue();
+                        boolean first = false;
+                        for (Map.Entry<Long, byte[]> version: vs.entrySet()) {
+                            if (!first) {
+                                Put put = new Put(result.getRow(), Schema.TIMESTAMP_INITIAL_LONG);
+                                put.add(fl, ql, version.getValue());
+                                reinsertSet.add(put);
+                                first = true;
+                            }
+                            Delete deleteThisVersion = new Delete(result.getRow());
+                            deleteThisVersion.deleteColumn(fl, ql, version.getKey());
+                            deleteSet.add(deleteThisVersion);
+                        }
                     }
                 }
+
                 // Reinsert all previous data, but with new timestamp
                 for (Put reinsert : reinsertSet) {
                     usertable.put(reinsert);
                 }
-                reinsertSet.clear();
-                reinsertSet = null;
+                usertable.delete(deleteSet);
             }
             scanner.close();
         }
@@ -1039,4 +1066,155 @@ public class HAcidClient {
         usertable.flushCommits();
     }
 
+    class PurgeRunnable implements Runnable {
+
+        public static final long PURGE_INTERVAL = 1000;
+
+        boolean running = true;
+        public PurgeRunnable() {
+            running = true;
+        }
+
+        public void stop() {
+            this.running = false;
+        }
+        @Override
+        public void run() {
+            Scan scan = new Scan();
+            int cacheSize = SCAN_TIMESTAMP_MAX_CACHE;
+            scan.setCaching(cacheSize);
+
+            while (running) {
+                boolean findFirstCommitted = false;
+                Result currentTxn;
+                ResultScanner scanner = null;
+                Map<String, List<Delete>> delMap = new HashMap<String, List<Delete>>();
+                List<Delete> logDelList = new LinkedList<Delete>();
+                Set<String> rowSet = new HashSet<String>();
+
+                try {
+                    scanner = timestamp_log_table.getScanner(scan);
+
+                    while ((currentTxn = scanner.next()) != null) {
+                        byte[] type = currentTxn.getColumnLatest(Schema.FAMILY_HACID,
+                                Schema.QUALIFIER_TS_TYPE).getValue();
+                        byte[] status = null;
+                        if (Bytes.equals(Schema.TYPE_START, type)) {
+                            status =  currentTxn.getColumnLatest(Schema.FAMILY_HACID,
+                                    Schema.QUALIFIER_TXN_STATE).getValue();
+
+                        }
+
+                        // find the first committed txn
+                        if (!findFirstCommitted) {
+                            if (Bytes.equals(Schema.TYPE_START, type)
+                                && (Bytes.equals(Schema.STATE_COMMITTED, status))) {
+                                    findFirstCommitted = true;
+                                    rowSet.addAll(parseWrites(currentTxn));
+                            }
+                            continue;
+                        }
+
+                        // already found the first committed txn
+                        long ts = HAcidClient.this.keyToTimestamp(currentTxn.getRow());
+                        if (Bytes.equals(Schema.TYPE_START, type)) {
+                            if (Bytes.equals(Schema.STATE_COMMITTED, status)
+                                    || Bytes.equals(Schema.STATE_ABORTED, status)) {
+                                byte[] endTs = currentTxn.getColumnLatest(Schema.FAMILY_HACID, Schema.QUALIFIER_END_TIMESTAMP).getValue();
+                                Set<String> writes = parseWrites(currentTxn);
+                                if (writes.isEmpty()) {
+                                    // no writes, delete the txn in the log table
+                                    Delete delLog = new Delete(HAcidClient.timestampToKey(endTs));
+                                    logDelList.add(delLog);
+                                    delLog = new Delete(currentTxn.getRow());
+                                    logDelList.add(delLog);
+                                }
+                                for (String write: writes) {
+                                    if (rowSet.contains(write)) {
+                                        // delete the old committed one
+                                        int delimit = write.indexOf(":");
+                                        String tableName = write.substring(0, delimit);
+                                        byte[] rowBytes = write.substring(delimit + 1).getBytes();
+                                        Delete del = new Delete(rowBytes, ts);
+                                        if (!delMap.containsKey(tableName)) {
+                                            delMap.put(tableName, new LinkedList<Delete>());
+                                        }
+                                        delMap.get(tableName).add(del);
+
+                                        // delete write in log_table
+                                        Delete delLog = new Delete(HAcidClient.timestampToKey(endTs));
+                                        delLog.deleteColumn(Schema.FAMILY_WRITESET, write.getBytes());
+                                        logDelList.add(delLog);
+                                    } else {
+                                        rowSet.add(write);
+                                    }
+                                }
+
+                            } else {    // STATE_ACTIVE
+                                LOG.debug("Cannot purge right now since txn is active");
+                                break;
+                            }
+                        } else {    // TYPE_END
+                            byte[] startTs = currentTxn.getColumnLatest(Schema.FAMILY_HACID, Schema.QUALIFIER_START_TIMESTAMP).getValue();
+                            Result startTxn = HAcidClient.this.getTimestampData(Bytes.toLong(startTs));
+                            if (Bytes.equals(startTxn.getColumnLatest(Schema.FAMILY_HACID,
+                                    Schema.QUALIFIER_TXN_STATE).getValue(), Schema.STATE_ACTIVE)) {
+                                LOG.debug("Cannot purge right now since txn is active");
+                                break;
+                            }
+                        }
+
+                    }   // while inner
+
+                    if (!delMap.isEmpty()) {
+                        for (Map.Entry<String, List<Delete>> del: delMap.entrySet()) {
+                            HTable table = new HTable(configuration_HBase, del.getKey());
+                            table.delete(del.getValue());
+                        }
+                    }
+                    if (!logDelList.isEmpty()) {
+                        timestamp_log_table.delete(logDelList);
+                    }
+
+                    // wait some time to launch another round purge
+                    Thread.sleep(PURGE_INTERVAL);
+
+                } catch (IOException e) {
+                    LOG.warn("cannot open scanner", e);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                } finally {
+                    if (scanner != null) {
+                        scanner.close();
+                    }
+                }
+            }   // while runnning
+            LOG.info("Closing");
+        }
+
+        Set<String> parseWrites(Result txn) {
+            Set<String> rows = new HashSet<String>();
+
+            byte[] endTs = txn.getColumnLatest(Schema.FAMILY_HACID, Schema.QUALIFIER_END_TIMESTAMP).getValue();
+            Result endTxn;
+            try {
+                endTxn = HAcidClient.this.getTimestampData(Bytes.toLong(endTs));
+            } catch (IOException e) {
+                return rows;
+            }
+
+            KeyValue[] kvs = endTxn.raw();
+            for (KeyValue kv: kvs) {
+                if (Bytes.equals(kv.getFamily(), Schema.FAMILY_WRITESET)) {
+                    if (Bytes.equals(kv.getValue(), Schema.MARKER_FALSE))
+                        continue;
+
+                    byte[] row = kv.getQualifier();
+                    rows.add(Bytes.toString(row));
+                }
+            }
+
+            return rows;
+        }
+    }
 }

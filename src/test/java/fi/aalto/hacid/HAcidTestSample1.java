@@ -42,7 +42,6 @@ public class HAcidTestSample1 {
 
     protected void createSample() throws Exception {
         conf = HBaseConfiguration.create();
-//        conf.addResource("/Users/liyinhgqw/w/workspace/hbase/conf/hbase-site.xml");
 
         HBaseAdmin admin = new HBaseAdmin(conf);
         assertTrue("HBase site must have no tables.", admin.listTables() == null || admin.listTables().length == 0);
