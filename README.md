@@ -3,7 +3,7 @@ HAcid enables multi-row transactions in HBase. This is a decentralized transacti
 
 ## Installing
 
-* Download the library from `dist/HAcid.jar` in this repository.
+* `mvn install`
 * Include the library in your project.
 * Make sure you have a working HBase installation, and the path to its configuration's `hbase-site.xml`.
 * Use the library's API to make and submit transactions.
@@ -58,6 +58,10 @@ boolean outcome = txn.commit(); // true is "committed", false is "aborted"
 * Unbounded number of operations per transaction
 * Unbounded number of tables and rows that a single transaction can span
 * Client-side transaction management algorithms (no server-side changes)
+
+## Be careful
+* It harms performance, whenever you don't need it, don't use it.
+* When creating `HAcidTable`, the original table is modified, only latest version of each cell is reserved.
 
 ## Authors
 * The original work is done by [Andre Medeiros](https://github.com/staltz)
